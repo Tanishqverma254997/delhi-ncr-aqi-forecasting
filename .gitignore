@@ -3,3 +3,4 @@ __pycache__/
 data/
 .env
 .ipynb_checkpoints/
+models/*.joblib

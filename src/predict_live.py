@@ -24,7 +24,7 @@ from src.ingestion.fetch_open_meteo_forecast import (
 
 DB_PATH = os.path.join(BASE_DIR, "data", "aqi_history.db")
 ALERT_MODEL_PATH = os.path.join(BASE_DIR, "models", "best_poor_alert_model.joblib")
-REG_MODEL_PATH = os.path.join(BASE_DIR, "models", "best_aqi_model.joblib")
+
 
 # ── Config ──────────────────────────────────────────────────────────────────
 DEFAULT_STATION = "Anand Vihar, Delhi - DPCC"
