@@ -1,89 +1,71 @@
-# Delhi-NCR Air Quality 24-Hour Forecasting & Safety Alert System
+# Delhi-NCR 24-hour PM2.5 forecasting
 
-## 1. Problem Statement
-This system provides 24-hour-ahead air quality forecasting for 40 Central Pollution Control Board (CPCB) and Delhi Pollution Control Committee (DPCC) continuous ambient air quality monitoring stations across Delhi-NCR. Its primary objective is to power an early-warning safety alert when ambient air quality is expected to cross into "Poor" or worse (CPCB PM2.5 $> 90\ \mu\text{g/m}^3$, corresponding to AQI sub-index $> 200$), providing municipal agencies and residents actionable advance notice before hazardous pollution episodes develop.
+The system forecasts the hourly mean PM2.5 concentration at 40 Delhi monitoring stations, 24 hours after the latest completed observation hour. Three classifiers estimate the probability that the target hour exceeds 90, 120 and 250 µg/m³. These are single-hour warning indicators. Regulatory AQI uses a different averaging period.
 
----
+## Benchmark on matched station-hours
 
-## 2. Pipeline Architecture
-The end-to-end pipeline consists of five stages:
-```
-[CPCB / Data.gov.in 15-Minute Parquets]
-       │
-       ▼
-[SQLite Storage (data/aqi_history.db - aqi_hourly)]
-       │
-       ▼
-[Feature Engineering (src/analysis/feature_engineering.py)]
-  ├── CPCB AQI sub-index conversions
-  ├── Temporal lags (1h, 2h, 3h, 6h, 24h) & rolling window statistics (6h, 24h)
-  ├── Multi-station spatial features (NCR regional mean PM2.5, NW stubble smoke front)
-  ├── Short-term pollution dynamics (3h/6h velocity differences, 6h acceleration)
-  ├── Calendar & seasonality indicators (hour, day of week, month, day-of-year harmonics)
-  └── 24-hour per-station target generation (target_pm25 = shift(-24), target_poor_or_worse)
-       │
-       ▼
-[Model Training & Evaluation (src/models/train_model.py)]
-  ├── Continuous PM2.5 Regressor (XGBRegressor) -> Point forecast baseline benchmark
-  └── Binary Safety Alert Classifier (XGBClassifier) -> 24h Hazard Probability
-       │
-       ▼
-[Inference & Live Safety Alert Dispatch (src/predict_live.py)]
-  ├── Evaluates station readings against tuned hazard probability threshold (0.25)
-  ├── Displays Open-Meteo 24h NWP meteorological advisory context
-  └── Dispatches Alert Tier ([CRITICAL ALERT] / [WATCH] / [NORMAL]) with precursor diagnostics
-```
+Both project versions were scored on the same 161,238 station-hours from 30 May 2025 at 23:00 through 31 December 2025 at 05:00 IST. All 40 stations are represented. Both versions used identical target values on these rows. The previous models were retrained before the changes and matched the original local model files byte for byte. Persistence predicts that each station will have its current PM2.5 reading again tomorrow.
 
----
+| Holdout metric | Persistence | Previous live configuration | Revised |
+| --- | ---: | ---: | ---: |
+| PM2.5 mean absolute error (µg/m³) ↓ | 35.01 | 34.33 | **32.40** |
+| PM2.5 root mean squared error (µg/m³) ↓ | 60.39 | 59.90 | **56.14** |
+| PM2.5 R² ↑ | 0.680 | 0.685 | **0.723** |
+| Six PM2.5 bands, accuracy ↑ | 54.40% | 54.16% | **56.06%** |
+| Poor-or-worse recall ↑ | 89.51% | 95.90% | **96.04%** |
+| Poor-or-worse false alarms ↓ | 5,927 | 9,188 | 9,335 |
+| Very-poor-or-worse recall ↑ | 85.49% | 96.21% | 96.05% |
+| Severe alert precision ↑ | 61.88% | 52.95% | 55.23% |
+| Severe alert recall ↑ | 59.58% | 69.92% | **70.81%** |
+| Severe alert F1 ↑ | 0.607 | 0.603 | **0.621** |
+| Four alert tiers, exact accuracy ↑ | **79.28%** | 78.32% | 78.73% |
+| Four alert tiers, macro F1 ↑ | **0.612** | 0.595 | 0.604 |
 
-## 3. Setup & Execution Instructions
+The previous live script used a 0.25 probability trigger for every tier. Its training benchmark reported tier decisions at 0.40, 0.40 and 0.25. Those earlier benchmark settings scored 79.44% four-tier accuracy on these rows. The revised benchmark and inference code both use the live 0.25 settings. The revised model missed 155 fewer severe station-hours and raised 823 fewer false severe alarms than the previous live configuration.
 
-### Prerequisites
-- Python 3.10+
-- Virtual environment (`venv`)
+### What changed
 
-### Installation
-```bash
-git clone <repo_url>
-cd "Delhi-NCR Air Quality Forecasting"
-python -m venv venv
+| Component | Previous version | Revised version |
+| --- | --- | --- |
+| Feature timing | Exact 24-hour target and purged splits, with historical lags calculated by row position | Preserves exact targets and split gaps. Computes station lags on an hourly grid and adds six recent-history features, including regional trends and the station's same-hour average across three days |
+| Missing observations | Dropped rows with any missing model input. Filled leading weather gaps with a training-period median | Requires observed PM2.5 at both ends for scoring. Carries weather forward within each station and lets XGBoost handle missing inputs |
+| Point forecast | XGBoost predicted the absolute future concentration | XGBoost predicts the change from current PM2.5. Validation selected a correction weight of 0.7991 to minimize squared error |
+| Alerts and serving | Separate model files, duplicated trigger settings, latest row from a labeled table | One bundle holds four fitted models, feature order, station codes, triggers and benchmark results. Batch scoring and station inference share the prediction function. The cache includes the latest unlabeled hours |
 
-# Activate virtual environment:
-# On Windows:
-.\venv\Scripts\activate
-# On Linux/macOS:
-source venv/bin/activate
+### Full revised holdout
 
-pip install -r requirements.txt
+Allowing missing predictors added 24,751 eligible station-hours. Across all **185,989** rows the revised model achieved MAE **31.52** and RMSE **55.08** µg/m³, compared with **34.49** and **61.00** for persistence. Its monthly MAE was below persistence in every reporting month, including the partial May window. Four-tier accuracy was **79.54%**, versus **80.05%** for persistence. The matched table above isolates the change in scores from this change in coverage. The model and training coverage changed together, so the comparison measures the complete pipeline.
+
+The training period contains 867,758 rows. Validation contains 178,352 rows beginning 7 November 2024 at 08:00 IST. Any training or validation row whose target reaches the following split is excluded. The correction weight was fixed on validation before refitting on training plus validation. The final test period has appeared in earlier project experiments. A later observation period is still needed to measure prospective performance.
+
+## Run locally
+
+The benchmark was run with Python 3.13.3. From the project root, activate the virtual environment and run:
+
+```sh
+python -m pip install -r requirements.txt
+python src/analysis/feature_engineering.py
+python src/models/train_model.py
+python src/predict_live.py --json
+python -m unittest discover -s tests -v
 ```
 
-### Script Execution Order
-To reproduce data ingestion, feature generation, model training, and inference from a clean clone:
+Feature engineering reads `data/aqi_history.db` and rebuilds the `aqi_features` cache from `aqi_hourly`. On a clean checkout, first run `python src/ingestion/fetch_cpcb_15min.py` to populate the hourly archive. The training command writes one bundle at `models/forecast_bundle.joblib` and prints JSON metrics for each alert threshold and monthly regression results. Its default split dates reproduce the comparison above. Use `--validation-start` and `--test-start` when evaluating another period.
 
-1. **Ingest Raw 15-Minute Parquet Data & Resample Hourly:**
-   ```bash
-   python src/ingestion/fetch_cpcb_15min.py
-   ```
-   *Downloads multi-year CPCB data (2022–2025), filters for 40 Delhi-NCR stations, aggregates 15-minute readings to 1-hour regular intervals, and writes 1,367,285 records to SQLite table `aqi_hourly`.*
+To replay the before-and-after comparison in this local checkout:
 
-2. **Run Feature Engineering:**
-   ```bash
-   python src/analysis/feature_engineering.py
-   ```
-   *Computes sub-indices, forward-fills station weather gaps with train-period medians, calculates past lags, velocity diffs, upwind gradients, and saves 1,075,166 records to table `aqi_features`.*
+```sh
+python scripts/compare_benchmark.py --previous-db data/benchmark_previous/holdout.db --previous-models data/benchmark_previous
+```
 
-3. **Train Models & Evaluate on Chronological Holdout:**
-   ```bash
-   python src/models/train_model.py
-   ```
-   *Splits data chronologically (Train: 2022-01-02 to 2024-11-07 [70%], Val: 2024-11-07 to 2025-05-30 [15%], Test: 2025-05-30 to 2025-12-31 [15%]), fits models on Train+Val, benchmarks against persistence, and saves artifacts to `models/`.*
+The legacy holdout snapshot and model files are local artifacts. SQL databases and trained models are excluded from Git. The comparison command accepts other snapshots with the same schemas.
 
-4. **Run Live Inference & Safety Alert:**
-   ```bash
-   python src/predict_live.py
-   ```
+## Inference for a frontend
 
----
+`python src/predict_live.py --station "Anand Vihar, Delhi - DPCC" --json` emits the observation hour, target hour, timezone, PM2.5 forecast, tier, probabilities, thresholds and a historical flag. Both timestamps denote the start of an hourly bucket in Asia/Kolkata. Issue forecasts after the observation bucket closes. The bundled local archive ends on 1 January 2026. The JSON marks a forecast whose target hour has passed as historical. A live deployment needs an ingestion job that supplies recent hourly observations and refreshes the feature cache.
+
+<details>
+<summary>Earlier project results and development notes (archived)</summary>
 
 ## 4. Results & Benchmark Evaluation
 
@@ -184,3 +166,5 @@ Reframing the task as a dedicated binary classification problem—*"Will air qua
    Ingest daily MODIS / VIIRS active thermal hotspot counts from Punjab and Haryana to provide direct leading indicators for transboundary agricultural stubble burning plumes during October–November.
 4. **Spatial Graph Neural Networks (GNN) / Wind-Directed Advection Modeling:**
    Replace static station coordinate encodings with wind-directed spatial graph convolution, explicitly routing pollution transport vectors down the prevailing atmospheric wind gradient across monitoring stations.
+
+</details>

@@ -553,3 +553,213 @@ Inspection of [src/predict_live.py](file:///c:/Users/tanis/OneDrive/Documents/De
 3. **Weather-Forecast Leak Bug**
    * *What it was:* Historical training matrices inadvertently incorporated future-shifted or forward-filled weather readings as input features, granting the model access to atmospheric parameters that would not yet exist at prediction time $t$.
    * *What the fix was:* All weather features in `feature_engineering.py` and `train_model.py` were strictly constrained to contemporaneous observations recorded at or before time $t$ (with weather gap-fills derived exclusively from training-period medians), while future weather is queried strictly at live inference time from external NWP forecasts for diagnostic display only.
+
+---
+
+## 6. Multi-Tier Alert System Implementation (Branch: `experiment/multi-tier-alert-system`)
+
+**Implementation Date:** 2026-09-06 / 2026-09-07  
+**Branch:** `experiment/multi-tier-alert-system` (branched from commit `06b4c8f`)  
+**Motivation:** While the single binary classifier (`PM2.5 > 90`) is statistically sound, 76–78% of Delhi winter days already cross into Poor-or-worse. A single binary alert fires nearly every day for 3 months, creating alert fatigue. The solution extends the proven classifier approach into a multi-tier escalation system without modifying underlying features or `feature_engineering.py`.
+
+### A. Git Status on Branch
+```text
+On branch experiment/multi-tier-alert-system
+Changes not staged for commit:
+	modified:   src/models/train_model.py
+	modified:   src/predict_live.py
+```
+
+### B. Target Definitions & CPCB Breakpoints (`src/models/train_model.py`)
+```python
+POOR_THRESHOLD = 90.0        # CPCB PM2.5 threshold for Poor or worse (>90 ug/m3 -> Sub-index >200)
+VERY_POOR_THRESHOLD = 120.0  # CPCB PM2.5 threshold for Very Poor or worse (>120 ug/m3 -> Sub-index >300)
+SEVERE_THRESHOLD = 250.0     # CPCB PM2.5 threshold for Severe (>250 ug/m3 -> Sub-index >400)
+```
+Targets added in `load_features()`:
+* `target_poor_or_worse = (df[TARGET_REG] > 90).astype(int)`
+* `target_very_poor_or_worse = (df[TARGET_REG] > 120).astype(int)`
+* `target_severe = (df[TARGET_REG] > 250).astype(int)`
+And corresponding time-$t$ persistence baselines (`current_poor_or_worse`, `current_very_poor_or_worse`, `current_severe`).
+
+### C. Independent Classifier Training & Saved Artifacts
+Three independent `XGBClassifier` models were fitted with identical hyperparameters (`n_estimators=350, max_depth=6, learning_rate=0.04, subsample=0.85, colsample_bytree=0.75, min_child_weight=8, reg_alpha=1.5, reg_lambda=4.0`):
+* `models/best_alert_poor.joblib` (and `models/best_poor_alert_model.joblib`)
+* `models/best_alert_verypoor.joblib`
+* `models/best_alert_severe.joblib`
+
+### D. Holdout Test Set Evaluation ($N=161,279$)
+
+#### 1. Tier 1: "Poor or Worse" Classifier ($\text{PM2.5} > 90\ \mu\text{g/m}^3$)
+* **Positive Class Support:** 61,940 / 161,279 (38.41%)
+* **Persistence Baseline:** Precision: 0.9034 | Recall: 0.8951 | F1: 0.8992 | (TN=93,412, FP=5,927, FN=6,498, TP=55,442)
+* **Model ROC-AUC:** **0.9792**
+* **Top 5 Features:** `pm25` (0.5141), `pm25_lag_1` (0.1619), `is_monsoon` (0.0550), `is_winter` (0.0323), `ncr_mean_pm25` (0.0302)
+* **Threshold Sweep:**
+```text
+ Threshold |  Precision |     Recall |   F1-Score |       TN |       FP |  FN (Misses) |       TP
+-----------------------------------------------------------------------------------------------
+      0.10 |     0.7733 |     0.9825 |     0.8654 |    81503 |    17836 |         1087 |    60853
+      0.20 |     0.8472 |     0.9663 |     0.9028 |    88545 |    10794 |         2089 |    59851
+      0.25 |     0.8658 |     0.9588 |     0.9099 |    90134 |     9205 |         2552 |    59388
+      0.28 |     0.8748 |     0.9539 |     0.9126 |    90883 |     8456 |         2858 |    59082
+      0.30 |     0.8800 |     0.9505 |     0.9139 |    91308 |     8031 |         3066 |    58874
+      0.35 |     0.8908 |     0.9420 |     0.9157 |    92185 |     7154 |         3592 |    58348
+      0.40 |     0.9018 |     0.9331 |     0.9172 |    93043 |     6296 |         4141 |    57799
+      0.50 |     0.9192 |     0.9116 |     0.9154 |    94378 |     4961 |         5478 |    56462
+      0.60 |     0.9333 |     0.8844 |     0.9082 |    95422 |     3917 |         7161 |    54779
+      0.70 |     0.9453 |     0.8520 |     0.8963 |    96288 |     3051 |         9166 |    52774
+      0.80 |     0.9575 |     0.7992 |     0.8712 |    97142 |     2197 |        12436 |    49504
+```
+
+#### 2. Tier 2: "Very Poor or Worse" Classifier ($\text{PM2.5} > 120\ \mu\text{g/m}^3$)
+* **Positive Class Support:** 50,660 / 161,279 (31.41%)
+* **Persistence Baseline:** Precision: 0.8678 | Recall: 0.8549 | F1: 0.8613 | (TN=104,019, FP=6,600, FN=7,353, TP=43,307)
+* **Model ROC-AUC:** **0.9739**
+* **Top 5 Features:** `pm25` (0.4263), `pm25_lag_1` (0.1693), `aqi` (0.1097), `aqi_lag_1` (0.1003), `is_monsoon` (0.0273)
+* **Threshold Sweep:**
+```text
+ Threshold |  Precision |     Recall |   F1-Score |       TN |       FP |  FN (Misses) |       TP
+-----------------------------------------------------------------------------------------------
+      0.10 |     0.7423 |     0.9865 |     0.8472 |    93272 |    17347 |          686 |    49974
+      0.20 |     0.7907 |     0.9707 |     0.8715 |    97606 |    13013 |         1486 |    49174
+      0.25 |     0.8050 |     0.9616 |     0.8764 |    98818 |    11801 |         1944 |    48716
+      0.28 |     0.8124 |     0.9554 |     0.8781 |    99439 |    11180 |         2258 |    48402
+      0.30 |     0.8166 |     0.9515 |     0.8789 |    99792 |    10827 |         2455 |    48205
+      0.35 |     0.8280 |     0.9419 |     0.8813 |   100708 |     9911 |         2945 |    47715
+      0.40 |     0.8382 |     0.9305 |     0.8820 |   101522 |     9097 |         3520 |    47140
+      0.50 |     0.8593 |     0.9014 |     0.8798 |   103140 |     7479 |         4995 |    45665
+      0.60 |     0.8806 |     0.8609 |     0.8706 |   104703 |     5916 |         7045 |    43615
+      0.70 |     0.9022 |     0.7992 |     0.8476 |   106230 |     4389 |        10175 |    40485
+      0.80 |     0.9241 |     0.6999 |     0.7966 |   107708 |     2911 |        15201 |    35459
+```
+
+#### 3. Tier 3: "Severe" Classifier ($\text{PM2.5} > 250\ \mu\text{g/m}^3$)
+* **Positive Class Support:** 17,341 / 161,279 (10.75%)
+* **Persistence Baseline:** Precision: 0.6188 | Recall: 0.5958 | F1: 0.6071 | (TN=137,575, FP=6,363, FN=7,010, TP=10,331)
+* **Model ROC-AUC:** **0.9406**
+* **Top 5 Features:** `pm25` (0.4385), `aqi` (0.1424), `pm25_lag_1` (0.1342), `aqi_lag_1` (0.0873), `is_winter` (0.0211)
+* **Threshold Sweep:**
+```text
+ Threshold |  Precision |     Recall |   F1-Score |       TN |       FP |  FN (Misses) |       TP
+-----------------------------------------------------------------------------------------------
+      0.10 |     0.4105 |     0.8913 |     0.5621 |   121742 |    22196 |         1885 |    15456
+      0.20 |     0.4946 |     0.7651 |     0.6008 |   130382 |    13556 |         4073 |    13268
+      0.25 |     0.5309 |     0.7101 |     0.6076 |   133060 |    10878 |         5028 |    12313
+      0.28 |     0.5495 |     0.6764 |     0.6064 |   134323 |     9615 |         5612 |    11729
+      0.30 |     0.5621 |     0.6550 |     0.6050 |   135089 |     8849 |         5983 |    11358
+      0.35 |     0.5906 |     0.6067 |     0.5985 |   136645 |     7293 |         6821 |    10520
+      0.40 |     0.6161 |     0.5585 |     0.5859 |   137902 |     6036 |         7656 |     9685
+      0.50 |     0.6615 |     0.4664 |     0.5471 |   139799 |     4139 |         9253 |     8088
+      0.60 |     0.7098 |     0.3730 |     0.4890 |   141293 |     2645 |        10873 |     6468
+      0.70 |     0.7659 |     0.2733 |     0.4029 |   142489 |     1449 |        12601 |     4740
+      0.80 |     0.8457 |     0.1603 |     0.2695 |   143431 |      507 |        14562 |     2779
+```
+
+#### Performance Drop in Severe:
+The Severe classifier performs meaningfully worse than Poor and Very Poor:
+1. Low positive prevalence (10.75%) increases false alarm rates.
+2. At threshold 0.50, recall collapses to 46.64% (missing 9,253 severe events).
+3. At threshold 0.25, recall recovers to 71.01% (cutting misses from 7,010 down to 5,028), but precision drops to 53.09% (10,878 false alarms).
+4. Extreme spikes $>250\ \mu\text{g/m}^3$ represent acute episodic anomalies (shallow nocturnal boundary layers, fire plumes, firecrackers) that are far harder to predict 24h out than broad regional background pollution.
+
+### E. Combined Multi-Tier Decision System (`get_alert_tier`)
+```python
+TIER_THRESHOLDS = {
+    "poor": 0.25,
+    "very_poor": 0.25,
+    "severe": 0.25,
+}
+
+def get_alert_tier(clf_poor, clf_verypoor, clf_severe, X, thresholds=None):
+    if thresholds is None:
+        thresholds = TIER_THRESHOLDS
+    th_poor, th_vp, th_sev = thresholds["poor"], thresholds["very_poor"], thresholds["severe"]
+    pred_poor = clf_poor.predict_proba(X)[:, 1] >= th_poor
+    pred_vp = clf_verypoor.predict_proba(X)[:, 1] >= th_vp
+    pred_sev = clf_severe.predict_proba(X)[:, 1] >= th_sev
+    tiers = np.where(pred_sev, "SEVERE",
+            np.where(pred_vp, "VERY_POOR",
+            np.where(pred_poor, "POOR", "NORMAL")))
+    return str(tiers[0]) if len(X) == 1 else pd.Series(tiers, index=X.index)
+```
+
+#### Inconsistency Audit on Holdout Test Set ($N=161,279$):
+```text
+  Operating Decision Thresholds : Poor=0.25, VeryPoor=0.25, Severe=0.25
+  Total Test Observations       : 161,279
+  Total Inconsistent Rows       : 3 (0.002%)
+    - Severe=True, VeryPoor=False: 0
+    - Severe=True, Poor=False    : 0
+    - VeryPoor=True, Poor=False  : 3
+  Resolution: Inconsistent predictions resolved to the highest active tier.
+```
+*Inconsistencies occurred in only **3 rows out of 161,279** (a **0.002% rate**), confirming near-perfect monotonic hierarchy across independent models.*
+
+#### Multi-Tier Classification Performance:
+```text
+  Multi-Tier Classification Report (Persistence Baseline):
+              precision    recall  f1-score   support
+
+      NORMAL     0.9350    0.9403    0.9376     99339
+        POOR     0.2700    0.2744    0.2722     11280
+   VERY_POOR     0.6333    0.6313    0.6323     33319
+      SEVERE     0.6188    0.5958    0.6071     17341
+
+    accuracy                         0.7929    161279
+   macro avg     0.6143    0.6104    0.6123    161279
+weighted avg     0.7922    0.7929    0.7925    161279
+
+  Multi-Tier Classification Report (Trained Multi-Tier System):
+              precision    recall  f1-score   support
+
+      NORMAL     0.9725    0.9073    0.9388     99339
+        POOR     0.2630    0.1884    0.2195     11280
+   VERY_POOR     0.5844    0.6546    0.6175     33319
+      SEVERE     0.5309    0.7101    0.6076     17341
+
+    accuracy                         0.7836    161279
+   macro avg     0.5877    0.6151    0.5958    161279
+weighted avg     0.7952    0.7836    0.7865    161279
+```
+
+### F. Live Multi-Tier Inference (`src/predict_live.py`)
+Updated to evaluate all three tier probabilities and dispatch tiered alert badges:
+* `[NORMAL]`
+* `[WATCH: POOR]`
+* `[ALERT: VERY POOR]`
+* `[CRITICAL: SEVERE]`
+
+#### Actual Verified Live Output:
+```text
+Querying Open-Meteo Forecast API for (28.647, 77.316) ...
+
+===========================================================================
+  DELHI-NCR 24-HOUR MULTI-TIER AIR QUALITY & METEOROLOGICAL ALERT SYSTEM
+===========================================================================
+  Station                     : Anand Vihar, Delhi - DPCC
+  Latest Station Reading      : 2025-12-31 05:00
+  Current Ambient PM2.5       : 613.5 ug/m3 (Sub-Index AQI: 500)
+---------------------------------------------------------------------------
+  Alert Tier Badge            : [CRITICAL: SEVERE]
+  Alert Status                : CRITICAL EMERGENCY: SEVERE AIR QUALITY EXPECTED (PM2.5 > 250 ug/m3)
+  Public Health Action        : Cease all outdoor exertion. Sensitive groups and general public must remain indoors with air filtration. Wear N95 masks outdoors.
+---------------------------------------------------------------------------
+  24-Hour Tier Hazard Probabilities:
+    * Poor or Worse (>90 ug/m3)      : 99.2% (Trigger: 25%)
+    * Very Poor or Worse (>120 ug/m3) : 98.4% (Trigger: 25%)
+    * Severe (>250 ug/m3)             : 27.0% (Trigger: 25%)
+---------------------------------------------------------------------------
+  Open-Meteo 24h Meteorological Advisory (NWP):
+    * Forecasted 24h Wind     : 0.47 m/s (Direction: 347 deg)
+    * Forecasted Temperature  : 24.6 C
+    * Forecasted Humidity     : 100.0%
+    * Forecasted Rainfall     : 0.00 mm
+---------------------------------------------------------------------------
+  Station Precursor Signals (Past Lags & Upwind Fronts):
+    * 3-Hour PM2.5 Surge      : +100.2 ug/m3
+    * Regional NCR Mean       : 338.9 ug/m3
+    * Upwind NW Smoke Front   : 338.9 ug/m3 (NW Gradient: -274.6)
+===========================================================================
+```
+

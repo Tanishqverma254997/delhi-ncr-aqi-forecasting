@@ -1,319 +1,150 @@
-"""train_model.py
-
-Trains both:
-1. 24h-ahead continuous PM2.5 regressor (XGBRegressor)
-2. 24h-ahead binary "Poor or worse" safety alert classifier (XGBClassifier)
-
-Benchmarks both against persistence baselines and saves artifacts.
-"""
-
+"""Train and benchmark 24-hour station forecasts on chronologically separated periods."""
+import argparse
+from contextlib import closing
+import json
 import os
+from pathlib import Path
 import sqlite3
+import sys
+import tempfile
+
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.metrics import (
-    mean_absolute_error,
-    r2_score,
-    root_mean_squared_error,
-    accuracy_score,
-    classification_report,
-    precision_score,
-    recall_score,
-    f1_score,
-    confusion_matrix,
-    roc_auc_score,
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, mean_absolute_error, r2_score, root_mean_squared_error
+from xgboost import XGBClassifier, XGBRegressor
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from src.models.forecast import (
+    BUNDLE_PATH, CANDIDATE_FEATURES, DB_PATH, FORECAST_HORIZON, TIER_LIMITS,
+    TIER_NAMES, TIER_THRESHOLDS, get_alert_tier, predict_batch,
 )
-from xgboost import XGBRegressor, XGBClassifier
 
-# ── Paths ───────────────────────────────────────────────────────────────────
-BASE_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
-DB_PATH = os.path.join(BASE_DIR, "data", "aqi_history.db")
-MODEL_DIR = os.path.join(BASE_DIR, "models")
-
-# ── Feature & Target Definitions ───────────────────────────────────────────
-CANDIDATE_FEATURES = [
-    # Current readings known at prediction time (t)
-    "aqi",
-    "pm25",
-    "pm10",
-    "no2",
-    "pm_ratio",
-    "ncr_mean_pm25",
-    "station_vs_ncr_ratio",
-    # Transition velocity & upwind front features (past t to t-6)
-    "nw_smoke_front",
-    "nw_gradient",
-    "pm25_diff_3",
-    "pm25_diff_6",
-    "pm25_accel",
-    "temp_drop_6",
-    "is_stagnant",
-    # Shifted AQI history (past lags t-1 to t-24)
-    "aqi_lag_1",
-    "aqi_lag_2",
-    "aqi_lag_3",
-    "aqi_lag_6",
-    "aqi_lag_24",
-    "aqi_rolling_mean_6",
-    "aqi_rolling_mean_24",
-    "aqi_rolling_std_6",
-    # Shifted pollutant history (past lags)
-    "pm25_lag_1",
-    "pm10_lag_1",
-    "no2_lag_1",
-    # Calendar & Seasonality (known at time t)
-    "hour",
-    "day_of_week",
-    "is_weekend",
-    "month",
-    "doy_sin",
-    "doy_cos",
-    "is_monsoon",
-    "is_winter",
-    # Current weather parameters at time t
-    "temperature",
-    "humidity",
-    "wind_speed",
-    "wind_direction",
-    "rainfall",
-    "pressure",
-    "solar_radiation",
-    # Station identifier
-    "station_encoded",
-]
 TARGET_REG = "target_pm25"
-POOR_THRESHOLD = 90.0  # CPCB PM2.5 threshold for Poor or worse (>90 ug/m3 -> Sub-index >200)
-
-TRAIN_RATIO = 0.70
-VAL_RATIO = 0.15
-
-
-def load_features():
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT * FROM aqi_features", conn)
-    conn.close()
-
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    features = [c for c in CANDIDATE_FEATURES if c in df.columns]
-
-    df["target_poor_or_worse"] = (df[TARGET_REG] > POOR_THRESHOLD).astype(int)
-    df["current_poor_or_worse"] = (df["pm25"] > POOR_THRESHOLD).astype(int)
-
-    df = df.dropna(subset=features + [TARGET_REG]).reset_index(drop=True)
-    print(f"Loaded {len(df)} records. Features active: {len(features)}")
-    return df, features
+# Freeze the previous benchmark's boundaries so changes in eligible rows cannot move the test.
+VALIDATION_START = "2024-11-07 08:00"
+TEST_START = "2025-05-30 23:00"
 
 
-def split_data(df: pd.DataFrame, features: list):
-    train_cutoff = df["timestamp"].quantile(TRAIN_RATIO)
-    val_cutoff = df["timestamp"].quantile(TRAIN_RATIO + VAL_RATIO)
-
-    train_df = (
-        df[df["timestamp"] < train_cutoff]
-        .sort_values("timestamp")
-        .reset_index(drop=True)
-    )
-    val_df = (
-        df[
-            (df["timestamp"] >= train_cutoff) & (df["timestamp"] < val_cutoff)
-        ]
-        .sort_values("timestamp")
-        .reset_index(drop=True)
-    )
-    test_df = (
-        df[df["timestamp"] >= val_cutoff]
-        .sort_values("timestamp")
-        .reset_index(drop=True)
-    )
-
-    print(
-        f"Temporal splits: Train={len(train_df)} ({train_df['timestamp'].min()} to {train_df['timestamp'].max()}), "
-        f"Val={len(val_df)} ({val_df['timestamp'].min()} to {val_df['timestamp'].max()}), "
-        f"Test={len(test_df)} ({test_df['timestamp'].min()} to {test_df['timestamp'].max()})"
-    )
-    return train_df, val_df, test_df
+def load_features(db_path=DB_PATH):
+    cols = ["station", "timestamp", TARGET_REG, *CANDIDATE_FEATURES]
+    with closing(sqlite3.connect(db_path)) as conn:
+        available = {row[1] for row in conn.execute("PRAGMA table_info(aqi_features)")}
+        if set(cols) - available:
+            raise ValueError("Rebuild aqi_features with src/analysis/feature_engineering.py first.")
+        sql = "SELECT " + ", ".join(cols) + " FROM aqi_features WHERE pm25 IS NOT NULL AND target_pm25 IS NOT NULL"
+        chunks = pd.read_sql_query(sql, conn, parse_dates=["timestamp"], chunksize=25000,
+                                   dtype=dict.fromkeys(CANDIDATE_FEATURES, "float32"))
+        return pd.concat(chunks, ignore_index=True), CANDIDATE_FEATURES
 
 
-def pm25_to_aqi_category(pm: pd.Series | np.ndarray) -> pd.Series:
-    """Map PM2.5 concentration (ug/m3) to official CPCB AQI categories."""
-    pm_s = pd.Series(pm)
-    conditions = [
-        pm_s <= 30,
-        (pm_s > 30) & (pm_s <= 60),
-        (pm_s > 60) & (pm_s <= 90),
-        (pm_s > 90) & (pm_s <= 120),
-        (pm_s > 120) & (pm_s <= 250),
-        pm_s > 250,
-    ]
-    categories = [
-        "Good",
-        "Satisfactory",
-        "Moderate",
-        "Poor",
-        "Very Poor",
-        "Severe",
-    ]
-    return pd.Series(np.select(conditions, categories, default="Unknown"), index=pm_s.index)
+def split_data(df, features=None, validation_start=None, test_start=None):
+    times = df["timestamp"]
+    val = pd.Timestamp(validation_start) if validation_start is not None else times.quantile(0.70)
+    test = pd.Timestamp(test_start) if test_start is not None else times.quantile(0.85)
+    target_time = times + FORECAST_HORIZON
+    masks = [target_time < val, (times >= val) & (target_time < test), times >= test]
+    parts = tuple(df.loc[mask].sort_values(["timestamp"], kind="stable").reset_index(drop=True) for mask in masks)
+    if any(part.empty for part in parts):
+        raise ValueError("Training, validation and test must each contain labeled station-hours.")
+    return parts
 
 
-def evaluate_regression(name: str, model, X: pd.DataFrame, y: pd.Series, features: list):
-    preds = model.predict(X)
-    mae = mean_absolute_error(y, preds)
-    rmse = root_mean_squared_error(y, preds)
-    r2 = r2_score(y, preds)
-
-    y_cat = pm25_to_aqi_category(y.values)
-    preds_cat = pm25_to_aqi_category(preds)
-    cat_acc = accuracy_score(y_cat, preds_cat)
-
-    print(f"\n-- {name} (Continuous PM2.5 Regression) --")
-    print(f"  MAE          : {mae:.4f}")
-    print(f"  RMSE         : {rmse:.4f}")
-    print(f"  R²           : {r2:.4f}")
-    print(f"  AQI Cat Acc  : {cat_acc:.4f} ({cat_acc*100:.2f}%)")
-
-    importances = model.feature_importances_
-    print("  Top 5 Features:")
-    for feat, imp in sorted(zip(features, importances), key=lambda x: -x[1])[:5]:
-        print(f"    {feat:22s}: {imp:.4f}")
-
-    print("\n  Per-Category Classification Report (from Regression Predictions):")
-    print(classification_report(y_cat, preds_cat, digits=4))
-
-    return {"mae": mae, "rmse": rmse, "r2": r2, "cat_acc": cat_acc, "preds": preds}
+def regression_metrics(y, pred):
+    limits = [30, 60, *TIER_LIMITS.values()]
+    return {"mae": float(mean_absolute_error(y, pred)), "rmse": float(root_mean_squared_error(y, pred)),
+            "r2": float(r2_score(y, pred)) if len(y) > 1 else None,
+            "band_accuracy": float(np.mean(np.digitize(y, limits, right=True) == np.digitize(pred, limits, right=True)))}
 
 
-def evaluate_persistence_regression(df: pd.DataFrame):
-    preds = df["pm25"]  # Naive forecast: PM2.5 tomorrow = PM2.5 today
-    y = df[TARGET_REG]
-
-    y_cat = pm25_to_aqi_category(y.values)
-    preds_cat = pm25_to_aqi_category(preds.values)
-    cat_acc = accuracy_score(y_cat, preds_cat)
-
-    print("\n-- Persistence Baseline (Continuous PM2.5 Regression) --")
-    print(f"  MAE          : {mean_absolute_error(y, preds):.4f}")
-    print(f"  RMSE         : {root_mean_squared_error(y, preds):.4f}")
-    print(f"  R²           : {r2_score(y, preds):.4f}")
-    print(f"  AQI Cat Acc  : {cat_acc:.4f} ({cat_acc*100:.2f}%)")
-    print("\n  Per-Category Classification Report (Persistence Baseline):")
-    print(classification_report(y_cat, preds_cat, digits=4))
+def score(y, point, alerts, tiers):
+    y = np.asarray(y)
+    result = {"regression": regression_metrics(y, point), "alerts": {}}
+    for name, limit in TIER_LIMITS.items():
+        tn, fp, fn, tp = confusion_matrix(y > limit, alerts[name], labels=[False, True]).ravel().tolist()
+        result["alerts"][name] = {"tp": tp, "fp": fp, "fn": fn, "tn": tn,
+            "precision": tp / max(tp + fp, 1), "recall": tp / max(tp + fn, 1),
+            "f1": 2 * tp / max(2 * tp + fp + fn, 1)}
+    actual = np.take(TIER_NAMES, np.digitize(y, list(TIER_LIMITS.values()), right=True))
+    result["tier_accuracy"] = float(accuracy_score(actual, tiers))
+    result["tier_macro_f1"] = float(f1_score(actual, tiers, labels=TIER_NAMES, average="macro", zero_division=0))
+    return result
 
 
-def evaluate_persistence_classification(df: pd.DataFrame):
-    y = df["target_poor_or_worse"]
-    preds = df["current_poor_or_worse"]
-
-    prec = precision_score(y, preds)
-    rec = recall_score(y, preds)
-    f1 = f1_score(y, preds)
-    cm = confusion_matrix(y, preds)
-
-    print("\n-- Persistence Baseline (Binary Poor-or-Worse Alert) --")
-    print(f"  Precision    : {prec:.4f}")
-    print(f"  Recall       : {rec:.4f}")
-    print(f"  F1-Score     : {f1:.4f}")
-    print(f"  Confusion Matrix: TN={cm[0,0]}, FP={cm[0,1]}, FN={cm[1,0]}, TP={cm[1,1]}")
-
-
-def evaluate_classifier(name: str, clf, X: pd.DataFrame, y: pd.Series, features: list):
-    probs = clf.predict_proba(X)[:, 1]
-    roc_auc = roc_auc_score(y, probs)
-
-    print(f"\n-- {name} (Binary Poor-or-Worse Alert) --")
-    print(f"  ROC-AUC      : {roc_auc:.4f}")
-
-    importances = clf.feature_importances_
-    print("  Top 5 Features for Safety Alert Classifier:")
-    for feat, imp in sorted(zip(features, importances), key=lambda x: -x[1])[:5]:
-        print(f"    {feat:22s}: {imp:.4f}")
-
-    print("\n  Threshold Evaluation Sweep:")
-    print(f"  {'Threshold':>10s} | {'Precision':>10s} | {'Recall':>10s} | {'F1-Score':>10s} | {'TN':>8s} | {'FP':>8s} | {'FN (Misses)':>12s} | {'TP':>8s}")
-    print("  " + "-" * 95)
-    for th in [0.10, 0.20, 0.25, 0.28, 0.30, 0.35, 0.40, 0.50, 0.60, 0.70, 0.80]:
-        preds_th = (probs >= th).astype(int)
-        prec = precision_score(y, preds_th, zero_division=0)
-        rec = recall_score(y, preds_th, zero_division=0)
-        f1 = f1_score(y, preds_th, zero_division=0)
-        cm = confusion_matrix(y, preds_th)
-        tn, fp, fn, tp = cm.ravel()
-        print(f"  {th:10.2f} | {prec:10.4f} | {rec:10.4f} | {f1:10.4f} | {tn:8d} | {fp:8d} | {fn:12d} | {tp:8d}")
+def benchmark(bundle, test):
+    pred = predict_batch(bundle, test)
+    pm = test["pm25"]
+    truth = test[TARGET_REG]
+    triggers = {name: pred[name] >= th for name, th in bundle["thresholds"].items()}
+    persistence = {name: pm > limit for name, limit in TIER_LIMITS.items()}
+    current_tiers = np.take(TIER_NAMES, np.digitize(pm, list(TIER_LIMITS.values()), right=True))
+    result = {"persistence": score(truth, pm, persistence, current_tiers),
+              "forecast": score(truth, pred.pm25_forecast, triggers, pred.tier), "months": {}}
+    for month, part in test.groupby(test.timestamp.dt.to_period("M")):
+        result["months"][str(month)] = {"rows": len(part),
+            "forecast": regression_metrics(part[TARGET_REG], pred.loc[part.index, "pm25_forecast"]),
+            "persistence": regression_metrics(part[TARGET_REG], part.pm25)}
+    return result
 
 
-def train_pipeline():
+def regressor():
+    return XGBRegressor(n_estimators=400, max_depth=6, learning_rate=0.05, subsample=0.8,
+                        colsample_bytree=0.8, reg_alpha=1, reg_lambda=2, random_state=42, n_jobs=-1)
+
+
+def train_pipeline(validation_start=VALIDATION_START, test_start=TEST_START):
     df, features = load_features()
-    train_df, val_df, test_df = split_data(df, features)
-
-    X_train, y_train_reg = train_df[features], train_df[TARGET_REG]
-    X_val, y_val_reg = val_df[features], val_df[TARGET_REG]
-    X_test, y_test_reg = test_df[features], test_df[TARGET_REG]
-
-    y_train_clf = train_df["target_poor_or_worse"]
-    y_val_clf = val_df["target_poor_or_worse"]
-    y_test_clf = test_df["target_poor_or_worse"]
-
-    X_trainval = pd.concat([X_train, X_val])
-    y_trainval_reg = pd.concat([y_train_reg, y_val_reg])
-    y_trainval_clf = pd.concat([y_train_clf, y_val_clf])
-
-    # 1. Train Continuous PM2.5 Regressor
-    print("\n" + "=" * 70)
-    print("1. TRAINING CONTINUOUS PM2.5 REGRESSION MODEL")
-    print("=" * 70)
-    reg = XGBRegressor(
-        n_estimators=400,
-        max_depth=6,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=1.0,
-        reg_lambda=2.0,
-        random_state=42,
-        n_jobs=-1,
-    )
-    print("Fitting XGBRegressor on Train+Val ...", flush=True)
-    reg.fit(X_trainval, y_trainval_reg, verbose=False)
-    print("Regression training complete.")
-
-    evaluate_persistence_regression(test_df)
-    evaluate_regression("Unseen Chronological Holdout Test Set", reg, X_test, y_test_reg, features)
-
-    # 2. Train Binary Safety Alert Classifier (with Precision-Tuned Regularization)
-    print("\n" + "=" * 70)
-    print("2. TRAINING BINARY 'POOR OR WORSE' SAFETY ALERT CLASSIFIER")
-    print("=" * 70)
-    clf = XGBClassifier(
-        n_estimators=350,
-        max_depth=6,
-        learning_rate=0.04,
-        subsample=0.85,
-        colsample_bytree=0.75,
-        min_child_weight=8,
-        reg_alpha=1.5,
-        reg_lambda=4.0,
-        random_state=42,
-        n_jobs=-1,
-        eval_metric="logloss",
-    )
-    print("Fitting Precision-Tuned XGBClassifier on Train+Val ...", flush=True)
-    clf.fit(X_trainval, y_trainval_clf)
-    print("Classification training complete.")
-
-    evaluate_persistence_classification(test_df)
-    evaluate_classifier("Unseen Chronological Holdout Test Set", clf, X_test, y_test_clf, features)
-
-    # Save artifacts
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    reg_path = os.path.join(MODEL_DIR, "best_aqi_model.joblib")
-    clf_path = os.path.join(MODEL_DIR, "best_poor_alert_model.joblib")
-
-    joblib.dump(reg, reg_path)
-    joblib.dump(clf, clf_path)
-    print(f"\nSaved regression model to: {reg_path}")
-    print(f"Saved classification model to: {clf_path}")
+    train, val, test = split_data(df, features, validation_start, test_start)
+    del df
+    print(f"Rows: train={len(train):,}, validation={len(val):,}, test={len(test):,}", flush=True)
+    # Fit a correction to persistence. Choose its strength using only validation errors.
+    model = regressor().fit(train[features], train[TARGET_REG] - train.pm25)
+    delta = model.predict(val[features]).astype("float64")
+    residual = (val[TARGET_REG] - val.pm25).to_numpy()
+    energy = np.dot(delta, delta)
+    weight = float(np.clip(np.dot(delta, residual) / energy, 0, 1)) if energy else 0.0
+    validation = {"weight": weight, "rows": len(val),
+                  "forecast": regression_metrics(val[TARGET_REG], np.maximum(0, val.pm25 + weight * delta)),
+                  "persistence": regression_metrics(val[TARGET_REG], val.pm25)}
+    print("Validation:", json.dumps(validation), flush=True)
+    fit = pd.concat([train, val], ignore_index=True)
+    station_codes = fit.drop_duplicates("station").set_index("station")["station_encoded"].to_dict()
+    X = fit[features]
+    reg = regressor().fit(X, fit[TARGET_REG] - fit.pm25)
+    classifiers = {}
+    for name, limit in TIER_LIMITS.items():
+        print(f"Training {name} classifier ...", flush=True)
+        target = fit[TARGET_REG] > limit
+        if target.nunique() != 2:
+            raise ValueError(f"The training period needs both outcomes for {name}.")
+        classifiers[name] = XGBClassifier(n_estimators=350, max_depth=6, learning_rate=0.04,
+            subsample=0.85, colsample_bytree=0.75, min_child_weight=8, reg_alpha=1.5,
+            reg_lambda=4, random_state=42, n_jobs=-1, eval_metric="logloss").fit(X, target)
+    bundle = {"features": features, "station_codes": station_codes, "regressor": reg,
+              "correction_weight": weight, "classifiers": classifiers, "thresholds": TIER_THRESHOLDS.copy(),
+              "horizon_hours": 24}
+    report = benchmark(bundle, test)
+    report.update({"validation_start": str(validation_start), "test_start": str(test_start),
+                   "test_end": str(test.timestamp.max()), "test_rows": len(test),
+                   "stations": int(test.station.nunique()), "train_rows": len(train), "validation": validation})
+    bundle["benchmark"] = report
+    BUNDLE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=BUNDLE_PATH.parent, delete=False) as handle:
+        tmp = Path(handle.name)
+    try:
+        joblib.dump(bundle, tmp)
+        os.replace(tmp, BUNDLE_PATH)
+    finally:
+        tmp.unlink(missing_ok=True)
+    print(json.dumps(report, indent=2, allow_nan=False))
+    return report
 
 
 if __name__ == "__main__":
-    train_pipeline()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--validation-start", default=VALIDATION_START)
+    parser.add_argument("--test-start", default=TEST_START)
+    args = parser.parse_args()
+    train_pipeline(args.validation_start, args.test_start)

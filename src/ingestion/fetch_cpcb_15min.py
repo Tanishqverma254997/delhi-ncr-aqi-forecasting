@@ -133,6 +133,7 @@ def save_to_db(df: pd.DataFrame):
 
 
 if __name__ == "__main__":
+    os.makedirs(DATA_DIR, exist_ok=True)
     all_dfs = []
     for year in YEARS:
         print(f"\n--- Processing {year} ---")

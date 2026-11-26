@@ -1,21 +1,22 @@
+from contextlib import closing
+from pathlib import Path
 import sqlite3
+import sys
+
+import joblib
 import pandas as pd
 from sklearn.metrics import r2_score
 
-DB_PATH = "data/aqi_history.db"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.models.forecast import BUNDLE_PATH, DB_PATH
 
-conn = sqlite3.connect(DB_PATH)
-df = pd.read_sql_query(
-    "SELECT timestamp, pm25, target_pm25 FROM aqi_features WHERE target_pm25 IS NOT NULL",
-    conn
-)
-conn.close()
-
-df["timestamp"] = pd.to_datetime(df["timestamp"])
-
-# Same test-set start date confirmed earlier from split_data() output
-test_start = pd.Timestamp("2025-05-30 23:00:00")
-test_df = df[df["timestamp"] >= test_start].copy()
+report = joblib.load(BUNDLE_PATH)["benchmark"]
+with closing(sqlite3.connect(DB_PATH)) as conn:
+    test_df = pd.read_sql_query(
+        """SELECT timestamp, pm25, target_pm25 FROM aqi_features
+           WHERE timestamp BETWEEN ? AND ? AND pm25 IS NOT NULL AND target_pm25 IS NOT NULL""",
+        conn, params=(str(pd.Timestamp(report["test_start"])), report["test_end"]),
+        parse_dates=["timestamp"])
 print(f"Full test set: {len(test_df)} rows, {test_df['timestamp'].min()} to {test_df['timestamp'].max()}")
 
 full_r2 = r2_score(test_df["target_pm25"], test_df["pm25"])
